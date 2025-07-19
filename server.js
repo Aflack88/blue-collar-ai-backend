@@ -13,7 +13,7 @@ app.use(cors({
     'http://localhost:3000',
     'https://blue-collar-buddy-91j5.vercel.app',
     'https://*.vercel.app'
-  ]
+  ],
   credentials: true
 }));
 app.use(express.json());
