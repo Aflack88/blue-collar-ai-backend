@@ -3,7 +3,9 @@ const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const rateLimit = require('express-rate-limit');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -27,12 +29,38 @@ const limiter = rateLimit({
 });
 app.use('/api', limiter);
 
+// Define robust selectors at the top
+const graingerSelectors = [
+  '[data-automation-id="product-tile"]',
+  '.search-result',
+  '.product-item',
+  '.product-card',
+  '.ProductTileContainer',
+  '[class*="product"]',
+  '[class*="tile"]',
+  '[class*="result"]',
+  '[role="listitem"]',
+  'article',
+  'li'
+];
+const mcmasterSelectors = [
+  '.ProductTableRow',
+  '.product-item',
+  '.search-result',
+  '.product',
+  '[class*="product"]',
+  '[class*="row"]',
+  '[role="row"]',
+  'tr'
+];
+
 // Enhanced multi-method scraper
 async function searchGrainger(query, maxResults = 5) {
   console.log(`🔍 Starting multi-method search for: "${query}"`);
   
   // Method 1: Try with advanced headers
   let results = await tryAdvancedHeaders(query, maxResults);
+  results = normalizeAndDeduplicate(results);
   if (results.length > 0) {
     console.log(`✅ Method 1 (Headers) succeeded: ${results.length} results`);
     return results;
@@ -40,6 +68,7 @@ async function searchGrainger(query, maxResults = 5) {
   
   // Method 2: Try with Puppeteer
   results = await tryPuppeteerMethod(query, maxResults);
+  results = normalizeAndDeduplicate(results);
   if (results.length > 0) {
     console.log(`✅ Method 2 (Puppeteer) succeeded: ${results.length} results`);
     return results;
@@ -47,6 +76,7 @@ async function searchGrainger(query, maxResults = 5) {
   
   // Method 3: Try McMaster-Carr as backup
   results = await tryMcMasterCarr(query, maxResults);
+  results = normalizeAndDeduplicate(results);
   if (results.length > 0) {
     console.log(`✅ Method 3 (McMaster) succeeded: ${results.length} results`);
     return results;
@@ -109,126 +139,119 @@ async function tryAdvancedHeaders(query, maxResults) {
 // Method 2: Puppeteer with stealth
 async function tryPuppeteerMethod(query, maxResults) {
   let browser;
-  
-  try {
-    console.log('🤖 Launching Puppeteer...');
-    
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--disable-features=VizDisplayCompositor'
-      ]
-    });
-    
-    const page = await browser.newPage();
-    
-    // Set random viewport
-    await page.setViewport({ 
-      width: 1366 + Math.floor(Math.random() * 200), 
-      height: 768 + Math.floor(Math.random() * 200) 
-    });
-    
-    // Set user agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Block images for faster loading
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      if (req.resourceType() === 'image' || req.resourceType() === 'stylesheet') {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-    
-    const searchUrl = `https://www.grainger.com/search?searchQuery=${encodeURIComponent(query)}`;
-    console.log(`🌐 Navigating to: ${searchUrl}`);
-    
-    // Random delay before navigation
-    await new Promise(resolve => setTimeout(resolve, Math.random() * 3000 + 2000));
-    
-    await page.goto(searchUrl, { 
-      waitUntil: 'domcontentloaded',
-      timeout: 30000 
-    });
-    
-    // Wait for content
-    await page.waitForTimeout(5000);
-    
-    // Extract data
-    const results = await page.evaluate((maxResults) => {
-      const products = [];
-      const selectors = [
-        '[data-automation-id="product-tile"]',
-        '.search-result',
-        '.product-item',
-        '.product-card',
-        '.ProductTileContainer'
-      ];
-      
-      console.log('🔍 Looking for products...');
-      
-      for (const selector of selectors) {
-        const elements = document.querySelectorAll(selector);
-        console.log(`Selector ${selector}: found ${elements.length} elements`);
-        
-        if (elements.length > 0) {
-          for (let i = 0; i < Math.min(elements.length, maxResults); i++) {
-            const elem = elements[i];
-            
-            const partNumber = elem.querySelector('[data-automation-id="product-item-number"], .product-number, .item-number')?.textContent?.trim() || '';
-            const name = elem.querySelector('[data-automation-id="product-title"], .product-title, h3, h4')?.textContent?.trim() || '';
-            const priceText = elem.querySelector('[data-automation-id="product-price"], .price, .product-price')?.textContent?.trim() || '';
-            const availability = elem.querySelector('[data-automation-id="product-availability"], .availability')?.textContent?.trim() || 'Available';
-            
-            console.log(`Product ${i}: ${partNumber} - ${name}`);
-            
-            if (partNumber && name) {
-              products.push({
-                partNumber,
-                name,
-                priceText,
-                availability,
-                supplier: 'Grainger',
-                source: 'Puppeteer'
-              });
-            }
-          }
+  let page;
+  let attempt = 0;
+  const maxAttempts = 3;
+  const baseDelay = 2000;
+  const searchUrl = `https://www.grainger.com/search?searchQuery=${encodeURIComponent(query)}`;
+
+  while (attempt < maxAttempts) {
+    try {
+      console.log('🤖 Launching Puppeteer... (attempt', attempt + 1, ')');
+      browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor'
+          // '--proxy-server=YOUR_PROXY_URL', // Uncomment and set for proxy
+        ]
+      });
+      page = await browser.newPage();
+      await page.setViewport({ 
+        width: 1366 + Math.floor(Math.random() * 200), 
+        height: 768 + Math.floor(Math.random() * 200) 
+      });
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+      await page.setRequestInterception(true);
+      page.on('request', (req) => {
+        if (req.resourceType() === 'image' || req.resourceType() === 'stylesheet') {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+      console.log(`🌐 Navigating to: ${searchUrl}`);
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 3000 + 2000));
+      await page.goto(searchUrl, { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+      });
+      // Wait for product selector or timeout
+      let foundSelector = null;
+      for (const selector of graingerSelectors) {
+        try {
+          await page.waitForSelector(selector, { timeout: 8000 });
+          foundSelector = selector;
           break;
+        } catch (e) {
+          // Try next selector
         }
       }
-      
-      console.log(`Found ${products.length} products total`);
-      return products;
-    }, maxResults);
-    
-    const processedResults = results.map(part => ({
-      ...part,
-      price: parsePrice(part.priceText),
-      inStock: !part.availability.toLowerCase().includes('out of stock'),
-      productUrl: searchUrl,
-      lastUpdated: new Date().toISOString()
-    }));
-    
-    console.log(`✅ Puppeteer extracted ${processedResults.length} parts`);
-    return processedResults;
-    
-  } catch (error) {
-    console.error('Method 2 (Puppeteer) failed:', error.message);
-  } finally {
-    if (browser) {
-      await browser.close();
+      if (!foundSelector) {
+        throw new Error('No product selectors found on page');
+      }
+      // Extract data
+      const results = await page.evaluate((maxResults, foundSelector) => {
+        const products = [];
+        const elements = document.querySelectorAll(foundSelector);
+        for (let i = 0; i < Math.min(elements.length, maxResults); i++) {
+          const elem = elements[i];
+          const partNumber = elem.querySelector('[data-automation-id="product-item-number"], .product-number, .item-number')?.textContent?.trim() || '';
+          const name = elem.querySelector('[data-automation-id="product-title"], .product-title, h3, h4')?.textContent?.trim() || '';
+          const priceText = elem.querySelector('[data-automation-id="product-price"], .price, .product-price')?.textContent?.trim() || '';
+          const availability = elem.querySelector('[data-automation-id="product-availability"], .availability')?.textContent?.trim() || 'Available';
+          if (partNumber && name) {
+            products.push({
+              partNumber,
+              name,
+              priceText,
+              availability,
+              supplier: 'Grainger',
+              source: 'Puppeteer'
+            });
+          }
+        }
+        return products;
+      }, maxResults, foundSelector);
+      const processedResults = results.map(part => ({
+        ...part,
+        price: parsePrice(part.priceText),
+        inStock: !part.availability.toLowerCase().includes('out of stock'),
+        productUrl: searchUrl,
+        lastUpdated: new Date().toISOString()
+      }));
+      console.log(`✅ Puppeteer extracted ${processedResults.length} parts`);
+      return processedResults;
+    } catch (error) {
+      console.error('Method 2 (Puppeteer) failed:', error.message);
+      if (page) {
+        try {
+          const html = await page.content();
+          require('fs').writeFileSync(`puppeteer_error_${Date.now()}.html`, html);
+          await page.screenshot({ path: `puppeteer_error_${Date.now()}.png` });
+        } catch (e) {
+          console.error('Failed to save error HTML/screenshot:', e.message);
+        }
+      }
+      attempt++;
+      if (attempt < maxAttempts) {
+        const delay = baseDelay * Math.pow(2, attempt); // Exponential backoff
+        console.log(`Retrying Puppeteer in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    } finally {
+      if (browser) {
+        await browser.close();
+      }
     }
   }
-  
   return [];
 }
 
@@ -251,9 +274,7 @@ async function tryMcMasterCarr(query, maxResults) {
     const results = [];
     
     // Try multiple selectors for McMaster
-    const selectors = ['.ProductTableRow', '.product-item', '.search-result', '.product'];
-    
-    for (const selector of selectors) {
+    for (const selector of mcmasterSelectors) {
       $(selector).each((index, element) => {
         if (index >= maxResults) return false;
         
@@ -295,16 +316,7 @@ async function tryMcMasterCarr(query, maxResults) {
 function parseGraingerHTML(html, query, maxResults) {
   const $ = cheerio.load(html);
   const results = [];
-  
-  const selectors = [
-    '[data-automation-id="product-tile"]',
-    '.search-result',
-    '.product-item',
-    '.product-card',
-    '.ProductTileContainer'
-  ];
-  
-  for (const selector of selectors) {
+  for (const selector of graingerSelectors) {
     const products = $(selector);
     
     if (products.length > 0) {
@@ -507,6 +519,25 @@ function parseAvailability(availabilityText) {
   if (!availabilityText) return true;
   const text = availabilityText.toLowerCase();
   return !text.includes('out of stock') && !text.includes('discontinued');
+}
+
+// Add normalization and deduplication before returning results in searchGrainger
+function normalizeAndDeduplicate(results) {
+  const seen = new Set();
+  return results.filter(item => {
+    const key = `${item.supplier}|${item.partNumber}|${item.name}`.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    // Normalize price
+    if (typeof item.price === 'string') item.price = parsePrice(item.price);
+    // Normalize inStock
+    if (typeof item.inStock !== 'boolean') item.inStock = parseAvailability(item.availability);
+    // Normalize productUrl
+    if (item.productUrl && !item.productUrl.startsWith('http')) {
+      item.productUrl = `https://www.grainger.com${item.productUrl}`;
+    }
+    return true;
+  });
 }
 
 // API Routes
