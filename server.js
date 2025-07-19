@@ -9,7 +9,11 @@ const port = process.env.PORT || 3001;
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:3000', 'https://your-frontend-domain.vercel.app'],
+  origin: [
+    'http://localhost:3000',
+    'https://blue-collar-buddy-91j5.vercel.app',  // Your actual Vercel URL
+    'https://*.vercel.app'  // Allow all Vercel subdomains
+  ],
   credentials: true
 }));
 app.use(express.json());
